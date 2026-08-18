@@ -53,6 +53,24 @@ Build the smallest end-to-end slice:
 6. Evaluate base vs ICL vs adapter.
 7. Save one result JSON.
 
+## Current Scripts
+
+Prepare leave-one-out TTT training records:
+
+```bash
+python train_ttt_adapter.py \
+  --input-folder ../ARC-AGI/data/training \
+  --output-adapter-folder outputs/preview \
+  --task-id 007bbfb7 \
+  --k-train-examples 4 \
+  --skip-on-insufficient-demos true \
+  --enable-loo true \
+  --enable-train-transforms false \
+  --seed 42
+```
+
+For SageMaker training, use `/opt/ml/input/data/arc` as the input folder and `/opt/ml/model` as the adapter output folder.
+
 ## Status
 
-Design in progress. Implementation has not started yet.
+TTT data preprocessing has started. Model training is not implemented yet.
