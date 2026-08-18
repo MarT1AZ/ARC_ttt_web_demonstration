@@ -211,6 +211,18 @@ TRANSFORMS: dict[str, Transform] = {
     "transpose": transpose,
 }
 
+# Inference/evaluation needs this to normalize transformed predictions back to
+# the original task orientation before scoring or voting.
+INVERSE_TRANSFORMS = {
+    "identity": "identity",
+    "rotate90": "rotate270",
+    "rotate180": "rotate180",
+    "rotate270": "rotate90",
+    "flip_h": "flip_h",
+    "flip_v": "flip_v",
+    "transpose": "transpose",
+}
+
 
 def transform_pair(pair: Pair, transform_name: str) -> Pair:
     """Apply one transform to both the input and output grid of a pair."""
@@ -223,12 +235,52 @@ def transform_pairs(pairs: list[Pair], transform_name: str) -> list[Pair]:
     return [transform_pair(pair, transform_name) for pair in pairs]
 
 
+def demo_order_variants(
+    demo_pairs: list[Pair],
+    demo_indices: list[int],
+    num_demo_permutations: int,
+    seed: int,
+    task_id: str,
+    heldout_index: int,
+    transform_name: str,
+) -> list[tuple[list[Pair], list[int], int]]:
+    """Build reproducible demo-order variants for one synthetic prompt.
+
+    A value of 1 means original order only. A value of 2 means original order
+    plus one seeded shuffle, matching the paper-style "n = 2" idea.
+    """
+    if num_demo_permutations < 1:
+        raise ValueError("--num-demo-permutations must be greater than 0")
+
+    variants = [(demo_pairs, demo_indices, 0)]
+    if len(demo_pairs) < 2:
+        return variants
+
+    for permutation_index in range(1, num_demo_permutations):
+        order = list(range(len(demo_pairs)))
+        variant_seed = seed + sum(ord(char) for char in task_id)
+        variant_seed += heldout_index * 101 + permutation_index * 1009
+        variant_seed += sum(ord(char) for char in transform_name)
+        random.Random(variant_seed).shuffle(order)
+
+        variants.append(
+            (
+                [demo_pairs[pos] for pos in order],
+                [demo_indices[pos] for pos in order],
+                permutation_index,
+            )
+        )
+    return variants
+
+
 def build_ttt_records_for_task(
     task_id: str,
     selected_pairs: list[Pair],
     selected_indices: list[int],
     enable_loo: bool = True,
     enable_train_transforms: bool = True,
+    num_demo_permutations: int = 1,
+    seed: int = 42,
 ) -> list[dict[str, Any]]:
     """Create JSONL-ready training records for one original ARC task.
 
@@ -236,7 +288,9 @@ def build_ttt_records_for_task(
     - LOO enabled creates k records.
     - LOO disabled creates k direct I/O records.
 
-    With transforms enabled, each record is repeated for every transform.
+    With transforms enabled, each record is repeated for every transform. With
+    permutations enabled, each transformed row is repeated with shuffled demo
+    order variants.
     """
     transform_names = DEFAULT_TRANSFORMS if enable_train_transforms else ("identity",)
     records: list[dict[str, Any]] = []
@@ -249,10 +303,14 @@ def build_ttt_records_for_task(
             demo_pairs = [
                 pair for pos, pair in enumerate(selected_pairs) if pos != heldout_pos
             ]
+            demo_indices = [
+                idx for pos, idx in enumerate(selected_indices) if pos != heldout_pos
+            ]
             mode = "loo_icl"
         else:
             # Direct I/O ablation: train on x -> y without task demonstrations.
             demo_pairs = []
+            demo_indices = []
             mode = "direct_io"
 
         # Transform augmentation multiplies the tiny per-task dataset while
@@ -262,29 +320,64 @@ def build_ttt_records_for_task(
             # task, otherwise the rule relationship changes.
             transformed_demos = transform_pairs(demo_pairs, transform_name)
             transformed_query = transform_pair(heldout_pair, transform_name)
-            prompt = build_icl_prompt(transformed_demos, transformed_query["input"])
-            target = build_target(transformed_query["output"])
 
-            # One record becomes one supervised training row for LoRA.
-            records.append(
-                {
-                    "task_id": task_id,
-                    "mode": mode,
-                    "transform": transform_name,
-                    "heldout_demo_index": selected_indices[heldout_pos],
-                    "context_demo_indices": []
-                    if not enable_loo
-                    else [
-                        idx
-                        for pos, idx in enumerate(selected_indices)
-                        if pos != heldout_pos
-                    ],
-                    "prompt": prompt,
-                    "target": target,
-                }
+            order_variants = demo_order_variants(
+                transformed_demos,
+                demo_indices,
+                num_demo_permutations=num_demo_permutations if enable_loo else 1,
+                seed=seed,
+                task_id=task_id,
+                heldout_index=selected_indices[heldout_pos],
+                transform_name=transform_name,
             )
+            for ordered_demos, ordered_indices, permutation_index in order_variants:
+                prompt = build_icl_prompt(ordered_demos, transformed_query["input"])
+                target = build_target(transformed_query["output"])
+
+                # One record becomes one supervised training row for LoRA.
+                records.append(
+                    {
+                        "task_id": task_id,
+                        "mode": mode,
+                        "transform": transform_name,
+                        "inverse_transform": INVERSE_TRANSFORMS[transform_name],
+                        "demo_permutation_index": permutation_index,
+                        "heldout_demo_index": selected_indices[heldout_pos],
+                        "context_demo_indices": ordered_indices,
+                        "prompt": prompt,
+                        "target": target,
+                    }
+                )
 
     return records
+
+
+def cap_records(
+    records: list[dict[str, Any]],
+    max_records: int | None,
+    seed: int,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """Limit one task's TTT dataset size, matching the paper's 250-row cap."""
+    if max_records is None:
+        return records
+    if max_records < 1:
+        raise ValueError("--max-ttt-records must be greater than 0")
+    if len(records) <= max_records:
+        return records
+
+    # Use a task-specific seed so multi-task runs are reproducible without
+    # selecting the exact same row positions for every task.
+    task_seed = seed + sum(ord(char) for char in task_id)
+    selected = random.Random(task_seed).sample(records, max_records)
+    return sorted(
+        selected,
+        key=lambda row: (
+            row["heldout_demo_index"],
+            row["transform"],
+            row["mode"],
+        ),
+    )
 
 
 def prepare_ttt_records(
@@ -293,6 +386,8 @@ def prepare_ttt_records(
     skip_on_insufficient_demos: bool,
     enable_loo: bool,
     enable_train_transforms: bool,
+    max_ttt_records: int | None = 250,
+    num_demo_permutations: int = 1,
     task_id: str | None = None,
     num_tasks: int | None = None,
     seed: int = 42,
@@ -334,26 +429,35 @@ def prepare_ttt_records(
 
         selected_pairs, selected_indices = selection
 
-        # Record task-level metadata before expanding demos into training rows.
+        # Expand selected demos into LOO/direct-I/O rows, then optional TF rows.
+        task_records = build_ttt_records_for_task(
+            task_id=current_task_id,
+            selected_pairs=selected_pairs,
+            selected_indices=selected_indices,
+            enable_loo=enable_loo,
+            enable_train_transforms=enable_train_transforms,
+            num_demo_permutations=num_demo_permutations,
+            seed=seed,
+        )
+        capped_task_records = cap_records(
+            task_records,
+            max_records=max_ttt_records,
+            seed=seed,
+            task_id=current_task_id,
+        )
+
+        # Record task-level metadata before appending rows to the full run.
         selected_tasks.append(
             {
                 "task_id": current_task_id,
                 "available_demos": len(task["train"]),
                 "selected_demo_indices": selected_indices,
                 "test_count": len(task["test"]),
+                "generated_record_count": len(task_records),
+                "used_record_count": len(capped_task_records),
             }
         )
-
-        # Expand selected demos into LOO/direct-I/O rows, then optional TF rows.
-        records.extend(
-            build_ttt_records_for_task(
-                task_id=current_task_id,
-                selected_pairs=selected_pairs,
-                selected_indices=selected_indices,
-                enable_loo=enable_loo,
-                enable_train_transforms=enable_train_transforms,
-            )
-        )
+        records.extend(capped_task_records)
 
     # The manifest is written beside the JSONL and should travel with any
     # future SageMaker adapter artifact.
@@ -363,6 +467,8 @@ def prepare_ttt_records(
         "skip_on_insufficient_demos": skip_on_insufficient_demos,
         "enable_loo": enable_loo,
         "enable_train_transforms": enable_train_transforms,
+        "max_ttt_records": max_ttt_records,
+        "num_demo_permutations": num_demo_permutations,
         "seed": seed,
         "shuffle_demos": shuffle_demos,
         "record_count": len(records),
