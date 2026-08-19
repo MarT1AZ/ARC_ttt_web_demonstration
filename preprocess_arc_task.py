@@ -3,8 +3,8 @@
 This script owns the task-prep step only:
 
 STEP 1: Ensure the Feature Group is ready.
-STEP 2: Create local ARC train/validation/test prep files.
-STEP 3: Upload those files to separate S3 channel paths.
+STEP 2: Create local ARC train/test prep files.
+STEP 3: Upload those files to exact S3 object paths.
 STEP 4: Write one Feature Store record with paths and preprocessing args.
 STEP 5: Read the record back and verify the run is complete.
 """
@@ -36,12 +36,10 @@ from ttt_data import (
 
 
 DEFAULT_BUCKET = "arc-ttt-artifact"
-DEFAULT_PREFIX = "task_ttt_prep"
+DEFAULT_PREFIX = "ttt_data"
 DEFAULT_FEATURE_GROUP = "arc_adapterops_task_prep"
 
-# Keep this list synced with the Feature Group created for ARC prep runs.
-# If the Feature Group is older or has the wrong schema, we abort before doing
-# local prep/upload work that cannot be registered.
+# Feature Group schema for processed ARC prep runs. One record = one run.
 REQUIRED_FEATURES = {
     "record_id",
     "event_time",
@@ -49,12 +47,12 @@ REQUIRED_FEATURES = {
     "run_id",
     "dataset_split",
     "training_s3_uri",
-    "validation_s3_uri",
     "test_s3_uri",
     "manifest_s3_uri",
     "task_split_s3_uri",
+    "generated_ttt_rows",
     "train_rows",
-    "validation_rows",
+    "was_capped",
     "test_rows",
     "k_train_examples",
     "skip_on_insufficient_demos",
@@ -150,12 +148,12 @@ def feature_definitions() -> list[dict[str, str]]:
         {"FeatureName": "run_id", "FeatureType": "String"},
         {"FeatureName": "dataset_split", "FeatureType": "String"},
         {"FeatureName": "training_s3_uri", "FeatureType": "String"},
-        {"FeatureName": "validation_s3_uri", "FeatureType": "String"},
         {"FeatureName": "test_s3_uri", "FeatureType": "String"},
         {"FeatureName": "manifest_s3_uri", "FeatureType": "String"},
         {"FeatureName": "task_split_s3_uri", "FeatureType": "String"},
+        {"FeatureName": "generated_ttt_rows", "FeatureType": "Integral"},
         {"FeatureName": "train_rows", "FeatureType": "Integral"},
-        {"FeatureName": "validation_rows", "FeatureType": "Integral"},
+        {"FeatureName": "was_capped", "FeatureType": "String"},
         {"FeatureName": "test_rows", "FeatureType": "Integral"},
         {"FeatureName": "k_train_examples", "FeatureType": "Integral"},
         {"FeatureName": "skip_on_insufficient_demos", "FeatureType": "String"},
@@ -218,16 +216,17 @@ def build_test_records(
     test_pairs: list[dict[str, Any]],
     enable_test_transforms: bool,
 ) -> list[dict[str, Any]]:
-    """Create prompts for the real task['test'] examples."""
+    """Create generic task['test'] rows for downstream evaluation."""
     transform_names = DEFAULT_TRANSFORMS if enable_test_transforms else ("identity",)
     records: list[dict[str, Any]] = []
 
     for test_index, test_pair in enumerate(test_pairs):
         for transform_name in transform_names:
-            # Test transforms are only for later inference/eval experiments.
-            # The inverse transform tells evaluation how to map output back.
-            transformed_demos = transform_pairs(selected_pairs, transform_name)
+            # Transformed test rows keep inverse_transform so downstream code can
+            # map predictions back before scoring.
             transformed_test = transform_pair(test_pair, transform_name)
+            transformed_demos = transform_pairs(selected_pairs, transform_name)
+
             records.append(
                 {
                     "task_id": task_id,
@@ -302,7 +301,7 @@ def step_1_ensure_feature_group_ready(args: argparse.Namespace) -> dict[str, Any
 
 
 def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, Any]:
-    """STEP 2: Build local training/validation/test files for one ARC task."""
+    """STEP 2: Build local training and test files for one ARC task."""
     print_step(2, "Create ARC prep")
 
     input_task_path = Path(args.input_task_path)
@@ -337,17 +336,15 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
         num_demo_permutations=args.num_demo_permutations,
         seed=args.seed,
     )
+    generated_ttt_rows = len(train_records)
     train_records = cap_records(
         train_records,
         max_records=args.max_ttt_records,
         seed=args.seed,
         task_id=task_id,
     )
-
-    # Validation intentionally mirrors training in v1. It gives the future
-    # trainer a separate validation channel without changing the experiment.
     training_records = [dict(record, channel="training") for record in train_records]
-    validation_records = [dict(record, channel="validation") for record in train_records]
+
     test_records = build_test_records(
         task_id=task_id,
         selected_pairs=selected_pairs,
@@ -357,9 +354,8 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
     )
 
     output_folder = Path(args.output_folder)
-    training_path = output_folder / "training" / "ttt_train.jsonl"
-    validation_path = output_folder / "validation" / "ttt_validation.jsonl"
-    test_path = output_folder / "test" / "test.jsonl"
+    training_path = output_folder / "ttt_train.jsonl"
+    test_path = output_folder / "test.jsonl"
     manifest_path = output_folder / "manifest.json"
     task_split_path = output_folder / "task_split.json"
 
@@ -377,7 +373,6 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
         task_split_path,
     )
     write_jsonl(training_records, training_path)
-    write_jsonl(validation_records, validation_path)
     write_jsonl(test_records, test_path)
 
     manifest = {
@@ -387,12 +382,12 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
         "input_task_path": str(input_task_path),
         "output_folder": str(output_folder),
         "training_path": str(training_path),
-        "validation_path": str(validation_path),
         "test_path": str(test_path),
         "task_split_path": str(task_split_path),
         "selected_demo_indices": selected_indices,
+        "generated_ttt_rows": generated_ttt_rows,
         "train_rows": len(training_records),
-        "validation_rows": len(validation_records),
+        "was_capped": args.max_ttt_records is not None and generated_ttt_rows > len(training_records),
         "test_rows": len(test_records),
         "k_train_examples": args.k_train_examples,
         "skip_on_insufficient_demos": args.skip_on_insufficient_demos,
@@ -407,8 +402,9 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
     write_json(manifest, manifest_path)
 
     print(f"Task ID: {task_id}")
+    print(f"Generated TTT rows: {generated_ttt_rows}")
     print(f"Training rows: {len(training_records)}")
-    print(f"Validation rows: {len(validation_records)}")
+    print(f"Was capped: {manifest['was_capped']}")
     print(f"Test rows: {len(test_records)}")
 
     return {
@@ -417,7 +413,6 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
         "dataset_split": dataset_split,
         "output_folder": output_folder,
         "training_path": training_path,
-        "validation_path": validation_path,
         "test_path": test_path,
         "manifest_path": manifest_path,
         "task_split_path": task_split_path,
@@ -426,26 +421,20 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
 
 
 def build_upload_plan(args: argparse.Namespace, prep: dict[str, Any]) -> list[dict[str, Any]]:
-    """Map local prep files to final S3 keys."""
+    """Map local prep files to exact S3 object keys in the run folder."""
     base_prefix = build_s3_key(args.s3_prefix, prep["task_id"], prep["run_id"])
     return [
         {
             "name": "training",
             "local_path": prep["training_path"],
             "bucket": args.s3_bucket,
-            "key": build_s3_key(base_prefix, "training", prep["training_path"].name),
-        },
-        {
-            "name": "validation",
-            "local_path": prep["validation_path"],
-            "bucket": args.s3_bucket,
-            "key": build_s3_key(base_prefix, "validation", prep["validation_path"].name),
+            "key": build_s3_key(base_prefix, prep["training_path"].name),
         },
         {
             "name": "test",
             "local_path": prep["test_path"],
             "bucket": args.s3_bucket,
-            "key": build_s3_key(base_prefix, "test", prep["test_path"].name),
+            "key": build_s3_key(base_prefix, prep["test_path"].name),
         },
         {
             "name": "manifest",
@@ -481,11 +470,6 @@ def abort_if_s3_targets_exist(s3_client, upload_plan: list[dict[str, Any]]) -> N
         raise RuntimeError("Abort: S3 target already exists:\n" + "\n".join(existing[:20]))
 
 
-def channel_uri_from_file_uri(file_uri: str) -> str:
-    """Convert s3://bucket/prefix/file.jsonl to s3://bucket/prefix/."""
-    return file_uri.rsplit("/", 1)[0] + "/"
-
-
 def step_3_upload(args: argparse.Namespace, prep: dict[str, Any]) -> dict[str, str]:
     """STEP 3: Upload prep artifacts and verify each S3 object exists."""
     import boto3
@@ -504,16 +488,14 @@ def step_3_upload(args: argparse.Namespace, prep: dict[str, Any]) -> dict[str, s
         uploaded_files[item["name"]] = s3_uri(item["bucket"], item["key"])
 
     uploaded = {
-        "training_s3_uri": channel_uri_from_file_uri(uploaded_files["training"]),
-        "validation_s3_uri": channel_uri_from_file_uri(uploaded_files["validation"]),
-        "test_s3_uri": channel_uri_from_file_uri(uploaded_files["test"]),
+        "training_s3_uri": uploaded_files["training"],
+        "test_s3_uri": uploaded_files["test"],
         "manifest_s3_uri": uploaded_files["manifest"],
         "task_split_s3_uri": uploaded_files["task_split"],
     }
 
-    print(f"Training: {uploaded['training_s3_uri']}")
-    print(f"Validation: {uploaded['validation_s3_uri']}")
-    print(f"Test: {uploaded['test_s3_uri']}")
+    print(f"Training file: {uploaded['training_s3_uri']}")
+    print(f"Test file: {uploaded['test_s3_uri']}")
     print("Upload verified")
     return uploaded
 
@@ -532,12 +514,12 @@ def build_feature_record(
         "run_id": prep["run_id"],
         "dataset_split": prep["dataset_split"],
         "training_s3_uri": uploaded["training_s3_uri"],
-        "validation_s3_uri": uploaded["validation_s3_uri"],
         "test_s3_uri": uploaded["test_s3_uri"],
         "manifest_s3_uri": uploaded["manifest_s3_uri"],
         "task_split_s3_uri": uploaded["task_split_s3_uri"],
+        "generated_ttt_rows": manifest["generated_ttt_rows"],
         "train_rows": manifest["train_rows"],
-        "validation_rows": manifest["validation_rows"],
+        "was_capped": bool_text(manifest["was_capped"]),
         "test_rows": manifest["test_rows"],
         "k_train_examples": args.k_train_examples,
         "skip_on_insufficient_demos": bool_text(args.skip_on_insufficient_demos),
@@ -613,7 +595,6 @@ def step_5_verify_feature_record(args: argparse.Namespace, record: dict[str, Any
     for key in (
         "record_id",
         "training_s3_uri",
-        "validation_s3_uri",
         "test_s3_uri",
         "manifest_s3_uri",
     ):
@@ -627,7 +608,7 @@ def step_5_verify_feature_record(args: argparse.Namespace, record: dict[str, Any
 def build_parser() -> argparse.ArgumentParser:
     """Declare the ARC prep arguments."""
     parser = argparse.ArgumentParser(
-        description="Preprocess one ARC task and register S3 channel paths."
+        description="Preprocess one ARC task and register exact S3 object paths."
     )
     parser.add_argument("--input-task-path", required=True)
     parser.add_argument("--output-folder", required=True)
