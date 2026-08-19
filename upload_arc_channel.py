@@ -71,53 +71,82 @@ def feature_group_exists(sagemaker_client, feature_group_name: str) -> bool:
 def create_arc_upload_feature_group(
     sagemaker_session,
     feature_group_name: str,
-    role_arn: str,
+    role_arn: str | None,
 ) -> None:
-    """Create an online Feature Group through the SageMaker SDK session."""
-    from sagemaker.feature_store.feature_definition import FeatureDefinition, FeatureTypeEnum
-    from sagemaker.feature_store.feature_group import FeatureGroup
+    """Create an online Feature Group through the SageMaker SDK session.
+
+    SageMaker SDK V2 and V3 changed Python helper paths, so this uses the
+    stable CreateFeatureGroup API from the boto session owned by SageMaker.
+    """
+    sagemaker_client = sagemaker_session.boto_session.client("sagemaker")
 
     # Keep this Feature Group tiny: it is only metadata for the uploaded ARC
     # channel, not the ARC examples themselves.
-    feature_definitions = [
-        FeatureDefinition(feature_name="record_id", feature_type=FeatureTypeEnum.STRING),
-        FeatureDefinition(feature_name="event_time", feature_type=FeatureTypeEnum.STRING),
-        FeatureDefinition(feature_name="channel_name", feature_type=FeatureTypeEnum.STRING),
-        FeatureDefinition(feature_name="bucket", feature_type=FeatureTypeEnum.STRING),
-        FeatureDefinition(feature_name="save_prefix", feature_type=FeatureTypeEnum.STRING),
-        FeatureDefinition(feature_name="s3_channel_uri", feature_type=FeatureTypeEnum.STRING),
-        FeatureDefinition(feature_name="file_count", feature_type=FeatureTypeEnum.INTEGRAL),
-        FeatureDefinition(feature_name="total_bytes", feature_type=FeatureTypeEnum.INTEGRAL),
-    ]
+    request = {
+        "FeatureGroupName": feature_group_name,
+        "RecordIdentifierFeatureName": "record_id",
+        "EventTimeFeatureName": "event_time",
+        "FeatureDefinitions": [
+            {"FeatureName": "record_id", "FeatureType": "String"},
+            {"FeatureName": "event_time", "FeatureType": "String"},
+            {"FeatureName": "channel_name", "FeatureType": "String"},
+            {"FeatureName": "bucket", "FeatureType": "String"},
+            {"FeatureName": "save_prefix", "FeatureType": "String"},
+            {"FeatureName": "s3_channel_uri", "FeatureType": "String"},
+            {"FeatureName": "file_count", "FeatureType": "Integral"},
+            {"FeatureName": "total_bytes", "FeatureType": "Integral"},
+        ],
+        "OnlineStoreConfig": {"EnableOnlineStore": True},
+        "Description": "Metadata for uploaded ARC data channels.",
+        "Tags": [{"Key": "project", "Value": "arc-adapterops"}],
+    }
+    if role_arn:
+        request["RoleArn"] = role_arn
 
-    feature_group = FeatureGroup(
-        name=feature_group_name,
-        feature_definitions=feature_definitions,
-        sagemaker_session=sagemaker_session,
-    )
-    feature_group.create(
-        s3_uri=False,
-        record_identifier_name="record_id",
-        event_time_feature_name="event_time",
-        role_arn=role_arn,
-        enable_online_store=True,
-        description="Metadata for uploaded ARC data channels.",
-        tags=[{"Key": "project", "Value": "arc-adapterops"}],
-    )
+    sagemaker_client.create_feature_group(**request)
 
 
-def resolve_role_arn(sagemaker_module, sagemaker_session, role_arn: str | None) -> str:
-    """Use CLI role when provided, otherwise use the current Studio role."""
+def build_sagemaker_session(region: str):
+    """Create a SageMaker session for SDK V3 first, then SDK V2."""
+    import boto3
+
+    try:
+        from sagemaker.core.helper.session_helper import Session
+
+        return Session(boto_session=boto3.Session(region_name=region))
+    except ImportError:
+        pass
+
+    try:
+        from sagemaker.session import Session
+
+        return Session(boto_session=boto3.Session(region_name=region))
+    except ImportError as exc:
+        raise RuntimeError("Could not import SageMaker Session. Run: pip install -U sagemaker") from exc
+
+
+def resolve_role_arn(sagemaker_session, role_arn: str | None) -> str | None:
+    """Use CLI role when provided, otherwise try the current Studio role."""
     if role_arn:
         return role_arn
 
     try:
-        return sagemaker_module.get_execution_role(sagemaker_session=sagemaker_session)
-    except Exception as exc:
-        raise RuntimeError(
-            "Could not auto-detect the SageMaker execution role. "
-            "Run again with --role-arn arn:aws:iam::<account-id>:role/<role-name>."
-        ) from exc
+        from sagemaker.core.helper.session_helper import get_execution_role
+
+        return get_execution_role()
+    except Exception:
+        pass
+
+    try:
+        import sagemaker
+
+        return sagemaker.get_execution_role(sagemaker_session=sagemaker_session)
+    except Exception:
+        print(
+            "Warning: could not auto-detect role ARN. Continuing without RoleArn "
+            "because online-only Feature Groups can be created without it."
+        )
+        return None
 
 
 def wait_for_feature_group_created(
@@ -221,16 +250,13 @@ def main() -> int:
     # Feature Group that the user must delete manually.
     files = list_local_files(data_path)
 
-    import boto3
-    import sagemaker
-
     # Use one shared boto/SageMaker session so Studio profile, region, and role
     # resolution behave the same way as later SageMaker training jobs.
-    boto_session = boto3.Session(region_name=args.region)
-    sagemaker_session = sagemaker.Session(boto_session=boto_session)
+    sagemaker_session = build_sagemaker_session(args.region)
+    boto_session = sagemaker_session.boto_session
     sagemaker_client = boto_session.client("sagemaker")
     s3_client = boto_session.client("s3")
-    role_arn = resolve_role_arn(sagemaker, sagemaker_session, args.role_arn)
+    role_arn = resolve_role_arn(sagemaker_session, args.role_arn)
 
     # STEP 1: Fail fast if the metadata registry name is already taken.
     print_step(1, "Verify Feature Group does not already exist")
