@@ -71,6 +71,8 @@ def feature_group_exists(sagemaker_client, feature_group_name: str) -> bool:
 def create_arc_upload_feature_group(
     sagemaker_session,
     feature_group_name: str,
+    bucket: str,
+    save_prefix: str,
     role_arn: str | None,
 ) -> None:
     """Create an online Feature Group through the SageMaker SDK session.
@@ -79,6 +81,7 @@ def create_arc_upload_feature_group(
     stable CreateFeatureGroup API from the boto session owned by SageMaker.
     """
     sagemaker_client = sagemaker_session.boto_session.client("sagemaker")
+    offline_store_uri = s3_uri(bucket, build_s3_key(save_prefix, "feature-store", ""))
 
     # Keep this Feature Group tiny: it is only metadata for the uploaded ARC
     # channel, not the ARC examples themselves.
@@ -97,6 +100,10 @@ def create_arc_upload_feature_group(
             {"FeatureName": "total_bytes", "FeatureType": "Integral"},
         ],
         "OnlineStoreConfig": {"EnableOnlineStore": True},
+        "OfflineStoreConfig": {
+            "S3StorageConfig": {"S3Uri": offline_store_uri},
+            "DisableGlueTableCreation": False,
+        },
         "Description": "Metadata for uploaded ARC data channels.",
         "Tags": [{"Key": "project", "Value": "arc-adapterops"}],
     }
@@ -272,6 +279,8 @@ def main() -> int:
     create_arc_upload_feature_group(
         sagemaker_session=sagemaker_session,
         feature_group_name=args.feature_group_name,
+        bucket=args.bucket,
+        save_prefix=args.save_prefix,
         role_arn=role_arn,
     )
     wait_for_feature_group_created(
