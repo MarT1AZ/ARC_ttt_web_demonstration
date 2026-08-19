@@ -235,6 +235,11 @@ def build_test_records(
                     "transform": transform_name,
                     "inverse_transform": INVERSE_TRANSFORMS[transform_name],
                     "context_demo_indices": selected_indices,
+                    # Keep structured grids beside the prompt so the viewer and
+                    # future trainers do not need to reverse-parse prompt text.
+                    "context_pairs": transformed_demos,
+                    "query_input": transformed_test["input"],
+                    "target_output": transformed_test.get("output"),
                     "prompt": build_icl_prompt(transformed_demos, transformed_test["input"]),
                     "expected_output": transformed_test.get("output"),
                     "original_expected_output": deepcopy(test_pair.get("output")),
