@@ -2,7 +2,7 @@
 
 This script owns the task-prep step only:
 
-STEP 1: Check the existing Feature Group.
+STEP 1: Ensure the Feature Group is ready.
 STEP 2: Create local ARC train/validation/test prep files.
 STEP 3: Upload those files to separate S3 channel paths.
 STEP 4: Write one Feature Store record with paths and preprocessing args.
@@ -37,7 +37,7 @@ from ttt_data import (
 
 DEFAULT_BUCKET = "arc-ttt-artifact"
 DEFAULT_PREFIX = "task_ttt_prep"
-DEFAULT_FEATURE_GROUP = "arc-adapterops-task-prep"
+DEFAULT_FEATURE_GROUP = "arc_adapterops_task_prep"
 
 # Keep this list synced with the Feature Group created for ARC prep runs.
 # If the Feature Group is older or has the wrong schema, we abort before doing
@@ -118,6 +118,99 @@ def infer_dataset_split(task_path: Path, explicit_split: str | None) -> str:
     return task_path.parent.name or "unknown"
 
 
+def resolve_role_arn(args: argparse.Namespace) -> str:
+    """Use CLI role when provided, otherwise try the current Studio role."""
+    if args.role_arn:
+        return args.role_arn
+
+    try:
+        from sagemaker.core.helper.session_helper import get_execution_role
+
+        return get_execution_role()
+    except Exception:
+        pass
+
+    try:
+        import sagemaker
+
+        return sagemaker.get_execution_role()
+    except Exception as exc:
+        raise RuntimeError(
+            "Abort: could not auto-detect role ARN for Feature Store offline storage. "
+            "Pass --role-arn arn:aws:iam::<account-id>:role/<role-name>."
+        ) from exc
+
+
+def feature_definitions() -> list[dict[str, str]]:
+    """Return the prep Feature Group schema."""
+    return [
+        {"FeatureName": "record_id", "FeatureType": "String"},
+        {"FeatureName": "event_time", "FeatureType": "String"},
+        {"FeatureName": "task_id", "FeatureType": "String"},
+        {"FeatureName": "run_id", "FeatureType": "String"},
+        {"FeatureName": "dataset_split", "FeatureType": "String"},
+        {"FeatureName": "training_s3_uri", "FeatureType": "String"},
+        {"FeatureName": "validation_s3_uri", "FeatureType": "String"},
+        {"FeatureName": "test_s3_uri", "FeatureType": "String"},
+        {"FeatureName": "manifest_s3_uri", "FeatureType": "String"},
+        {"FeatureName": "task_split_s3_uri", "FeatureType": "String"},
+        {"FeatureName": "train_rows", "FeatureType": "Integral"},
+        {"FeatureName": "validation_rows", "FeatureType": "Integral"},
+        {"FeatureName": "test_rows", "FeatureType": "Integral"},
+        {"FeatureName": "k_train_examples", "FeatureType": "Integral"},
+        {"FeatureName": "skip_on_insufficient_demos", "FeatureType": "String"},
+        {"FeatureName": "shuffle_demos", "FeatureType": "String"},
+        {"FeatureName": "seed", "FeatureType": "Integral"},
+        {"FeatureName": "enable_loo", "FeatureType": "String"},
+        {"FeatureName": "enable_train_transforms", "FeatureType": "String"},
+        {"FeatureName": "enable_test_transforms", "FeatureType": "String"},
+        {"FeatureName": "num_demo_permutations", "FeatureType": "Integral"},
+        {"FeatureName": "max_ttt_records", "FeatureType": "Integral"},
+        {"FeatureName": "selected_demo_indices", "FeatureType": "String"},
+    ]
+
+
+def create_feature_group(sm_client, args: argparse.Namespace) -> None:
+    """Create the prep Feature Group when first-run setup is allowed."""
+    offline_store_uri = s3_uri(args.s3_bucket, build_s3_key(args.s3_prefix, "feature-store"))
+
+    sm_client.create_feature_group(
+        FeatureGroupName=args.feature_group_name,
+        RecordIdentifierFeatureName="record_id",
+        EventTimeFeatureName="event_time",
+        FeatureDefinitions=feature_definitions(),
+        OnlineStoreConfig={"EnableOnlineStore": True},
+        OfflineStoreConfig={
+            "S3StorageConfig": {"S3Uri": offline_store_uri},
+            "DisableGlueTableCreation": False,
+        },
+        RoleArn=resolve_role_arn(args),
+        Description="ARC AdapterOps task preprocessing metadata.",
+        Tags=[{"Key": "project", "Value": "arc-adapterops"}],
+    )
+
+
+def wait_for_feature_group_created(
+    sm_client,
+    feature_group_name: str,
+    timeout_seconds: int,
+    poll_seconds: int = 10,
+) -> None:
+    """Wait until a newly created Feature Group is ready."""
+    deadline = time.time() + timeout_seconds
+    while True:
+        desc = sm_client.describe_feature_group(FeatureGroupName=feature_group_name)
+        status = desc.get("FeatureGroupStatus")
+        if status == "Created":
+            return
+        if status == "CreateFailed":
+            raise RuntimeError(desc.get("FailureReason", "Feature Group creation failed"))
+        if time.time() >= deadline:
+            raise TimeoutError(f"Timed out waiting for Feature Group: {feature_group_name}")
+        print(f"Feature Group status: {status}; waiting {poll_seconds}s")
+        time.sleep(poll_seconds)
+
+
 def build_test_records(
     task_id: str,
     selected_pairs: list[dict[str, Any]],
@@ -152,12 +245,12 @@ def build_test_records(
     return records
 
 
-def step_1_check_feature_group(args: argparse.Namespace) -> dict[str, Any]:
-    """STEP 1: Verify the Feature Group exists and can store prep metadata."""
+def step_1_ensure_feature_group_ready(args: argparse.Namespace) -> dict[str, Any]:
+    """STEP 1: Create if allowed, then validate the prep Feature Group."""
     import boto3
     from botocore.exceptions import ClientError
 
-    print_step(1, "Check Feature Group exists")
+    print_step(1, "Ensure Feature Group ready")
     sm_client = boto3.client("sagemaker", region_name=args.region)
 
     try:
@@ -165,11 +258,24 @@ def step_1_check_feature_group(args: argparse.Namespace) -> dict[str, Any]:
     except ClientError as exc:
         code = exc.response.get("Error", {}).get("Code", "")
         if code in {"ResourceNotFound", "ResourceNotFoundException", "ValidationException"}:
+            if args.create_feature_group_if_missing:
+                print(f"Feature Group missing; creating: {args.feature_group_name}")
+                create_feature_group(sm_client, args)
+                wait_for_feature_group_created(
+                    sm_client,
+                    args.feature_group_name,
+                    timeout_seconds=args.feature_group_timeout_seconds,
+                )
+                desc = sm_client.describe_feature_group(FeatureGroupName=args.feature_group_name)
+            else:
+                raise RuntimeError(
+                    f"Abort: Feature Group is missing: {args.feature_group_name}. "
+                    "Pass --create-feature-group-if-missing true for first-time setup."
+                ) from exc
+        else:
             raise RuntimeError(
-                f"Abort: Feature Group is missing: {args.feature_group_name}. "
-                "Create it first with the ARC prep schema."
+                f"Abort: could not describe Feature Group {args.feature_group_name}."
             ) from exc
-        raise
 
     status = desc.get("FeatureGroupStatus")
     if status != "Created":
@@ -542,6 +648,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--s3-bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--s3-prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--feature-group-name", default=DEFAULT_FEATURE_GROUP)
+    parser.add_argument("--create-feature-group-if-missing", type=str_to_bool, default=False)
+    parser.add_argument("--feature-group-timeout-seconds", type=int, default=900)
+    parser.add_argument("--role-arn", default=None)
     parser.add_argument("--region", default="ap-southeast-1")
     return parser
 
@@ -551,7 +660,7 @@ def main() -> int:
     args = build_parser().parse_args()
     run_id = args.run_id or utc_now_id()
 
-    step_1_check_feature_group(args)
+    step_1_ensure_feature_group_ready(args)
     prep = step_2_create_arc_prep(args, run_id)
     uploaded = step_3_upload(args, prep)
     record = step_4_put_feature_record(args, prep, uploaded)
