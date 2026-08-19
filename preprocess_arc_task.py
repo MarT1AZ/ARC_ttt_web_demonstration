@@ -230,7 +230,6 @@ def build_test_records(
             records.append(
                 {
                     "task_id": task_id,
-                    "channel": "test",
                     "test_index": test_index,
                     "transform": transform_name,
                     "inverse_transform": INVERSE_TRANSFORMS[transform_name],
@@ -348,7 +347,7 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
         seed=args.seed,
         task_id=task_id,
     )
-    training_records = [dict(record, channel="training") for record in train_records]
+    training_records = train_records
 
     test_records = build_test_records(
         task_id=task_id,
