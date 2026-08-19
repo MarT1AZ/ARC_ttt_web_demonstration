@@ -13,26 +13,309 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import time
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from ttt_data import (
-    DEFAULT_TRANSFORMS,
-    INVERSE_TRANSFORMS,
-    build_icl_prompt,
-    build_ttt_records_for_task,
-    cap_records,
-    load_task,
-    select_demo_pairs,
-    task_id_from_path,
-    transform_pair,
-    transform_pairs,
-    write_json,
-    write_jsonl,
+
+Grid = list[list[int]]
+Pair = dict[str, Grid]
+Transform = Callable[[Grid], Grid]
+
+# These transforms create small, invertible ARC variants for TTT data.
+DEFAULT_TRANSFORMS = (
+    "identity",
+    "rotate90",
+    "rotate180",
+    "rotate270",
+    "flip_h",
+    "flip_v",
+    "transpose",
 )
+
+
+def load_task(task_path: str | Path) -> dict[str, Any]:
+    """Load one ARC task file and fail early if it is not ARC-shaped."""
+    with Path(task_path).open("r", encoding="utf-8") as f:
+        task = json.load(f)
+    if "train" not in task or "test" not in task:
+        raise ValueError(f"ARC task is missing train/test keys: {task_path}")
+    return task
+
+
+def task_id_from_path(task_path: str | Path) -> str:
+    """Convert data/training/007bbfb7.json into task ID 007bbfb7."""
+    return Path(task_path).stem
+
+
+def select_demo_pairs(
+    task: dict[str, Any],
+    k_train_examples: int,
+    seed: int = 42,
+    shuffle_demos: bool = False,
+    skip_on_insufficient_demos: bool = True,
+) -> tuple[list[Pair], list[int]] | None:
+    """Select k task demonstrations and keep their original task indices."""
+    if k_train_examples < 1:
+        raise ValueError("--k-train-examples must be greater than 0")
+
+    demos = task["train"]
+    if len(demos) < k_train_examples and skip_on_insufficient_demos:
+        return None
+
+    indices = list(range(len(demos)))
+    if shuffle_demos:
+        # Seeded shuffle keeps runs reproducible across SageMaker reruns.
+        random.Random(seed).shuffle(indices)
+
+    selected_indices = indices[: min(k_train_examples, len(indices))]
+    selected = [deepcopy(demos[i]) for i in selected_indices]
+    return selected, selected_indices
+
+
+def grid_to_text(grid: Grid) -> str:
+    """Serialize an ARC grid compactly for prompt text."""
+    return json.dumps(grid, separators=(",", ":"))
+
+
+def build_icl_prompt(demo_pairs: list[Pair], query_grid: Grid) -> str:
+    """Build the prompt shared by ICL test rows and LOO training rows."""
+    lines = [
+        "You are solving an ARC grid transformation task.",
+        "Infer the rule from the examples, then answer the query.",
+        "Return only JSON in this exact format: {\"output\": [[...]]}",
+        "",
+    ]
+
+    for idx, pair in enumerate(demo_pairs, start=1):
+        lines.extend(
+            [
+                f"Example {idx} input:",
+                grid_to_text(pair["input"]),
+                f"Example {idx} output:",
+                grid_to_text(pair["output"]),
+                "",
+            ]
+        )
+
+    lines.extend(["Query input:", grid_to_text(query_grid), "Answer:"])
+    return "\n".join(lines)
+
+
+def build_target(output_grid: Grid) -> str:
+    """Build the supervised target text for one JSONL training row."""
+    return json.dumps({"output": output_grid}, separators=(",", ":"))
+
+
+def identity(grid: Grid) -> Grid:
+    """No-op transform."""
+    return deepcopy(grid)
+
+
+def rotate90(grid: Grid) -> Grid:
+    """Rotate grid 90 degrees clockwise."""
+    return [list(row) for row in zip(*grid[::-1])]
+
+
+def rotate180(grid: Grid) -> Grid:
+    """Rotate grid 180 degrees."""
+    return [row[::-1] for row in grid[::-1]]
+
+
+def rotate270(grid: Grid) -> Grid:
+    """Rotate grid 270 degrees clockwise."""
+    return [list(row) for row in zip(*grid)][::-1]
+
+
+def flip_h(grid: Grid) -> Grid:
+    """Flip grid horizontally."""
+    return [row[::-1] for row in grid]
+
+
+def flip_v(grid: Grid) -> Grid:
+    """Flip grid vertically."""
+    return grid[::-1]
+
+
+def transpose(grid: Grid) -> Grid:
+    """Reflect grid across the main diagonal."""
+    return [list(row) for row in zip(*grid)]
+
+
+TRANSFORMS: dict[str, Transform] = {
+    "identity": identity,
+    "rotate90": rotate90,
+    "rotate180": rotate180,
+    "rotate270": rotate270,
+    "flip_h": flip_h,
+    "flip_v": flip_v,
+    "transpose": transpose,
+}
+
+INVERSE_TRANSFORMS = {
+    "identity": "identity",
+    "rotate90": "rotate270",
+    "rotate180": "rotate180",
+    "rotate270": "rotate90",
+    "flip_h": "flip_h",
+    "flip_v": "flip_v",
+    "transpose": "transpose",
+}
+
+
+def transform_pair(pair: Pair, transform_name: str) -> Pair:
+    """Apply one transform to both input and output grids."""
+    fn = TRANSFORMS[transform_name]
+    return {"input": fn(pair["input"]), "output": fn(pair["output"])}
+
+
+def transform_pairs(pairs: list[Pair], transform_name: str) -> list[Pair]:
+    """Apply one transform to a list of ARC pairs."""
+    return [transform_pair(pair, transform_name) for pair in pairs]
+
+
+def demo_order_variants(
+    demo_pairs: list[Pair],
+    demo_indices: list[int],
+    num_demo_permutations: int,
+    seed: int,
+    task_id: str,
+    heldout_index: int,
+    transform_name: str,
+) -> list[tuple[list[Pair], list[int], int]]:
+    """Create reproducible prompt-order variants for one synthetic row."""
+    if num_demo_permutations < 1:
+        raise ValueError("--num-demo-permutations must be greater than 0")
+
+    variants = [(demo_pairs, demo_indices, 0)]
+    if len(demo_pairs) < 2:
+        return variants
+
+    for permutation_index in range(1, num_demo_permutations):
+        order = list(range(len(demo_pairs)))
+        variant_seed = seed + sum(ord(char) for char in task_id)
+        variant_seed += heldout_index * 101 + permutation_index * 1009
+        variant_seed += sum(ord(char) for char in transform_name)
+        random.Random(variant_seed).shuffle(order)
+        variants.append(
+            (
+                [demo_pairs[pos] for pos in order],
+                [demo_indices[pos] for pos in order],
+                permutation_index,
+            )
+        )
+    return variants
+
+
+def build_ttt_records_for_task(
+    task_id: str,
+    selected_pairs: list[Pair],
+    selected_indices: list[int],
+    enable_loo: bool = True,
+    enable_train_transforms: bool = True,
+    num_demo_permutations: int = 1,
+    seed: int = 42,
+) -> list[dict[str, Any]]:
+    """Create prompt/target TTT records for one ARC task."""
+    transform_names = DEFAULT_TRANSFORMS if enable_train_transforms else ("identity",)
+    records: list[dict[str, Any]] = []
+
+    for heldout_pos, heldout_pair in enumerate(selected_pairs):
+        if enable_loo:
+            # One demo becomes the supervised query; the rest become context.
+            demo_pairs = [
+                pair for pos, pair in enumerate(selected_pairs) if pos != heldout_pos
+            ]
+            demo_indices = [
+                idx for pos, idx in enumerate(selected_indices) if pos != heldout_pos
+            ]
+            mode = "loo_icl"
+        else:
+            # Direct I/O ablation has no context examples.
+            demo_pairs = []
+            demo_indices = []
+            mode = "direct_io"
+
+        for transform_name in transform_names:
+            transformed_demos = transform_pairs(demo_pairs, transform_name)
+            transformed_query = transform_pair(heldout_pair, transform_name)
+
+            order_variants = demo_order_variants(
+                transformed_demos,
+                demo_indices,
+                num_demo_permutations=num_demo_permutations if enable_loo else 1,
+                seed=seed,
+                task_id=task_id,
+                heldout_index=selected_indices[heldout_pos],
+                transform_name=transform_name,
+            )
+            for ordered_demos, ordered_indices, permutation_index in order_variants:
+                # The row keeps prompt/target for training and indices for audit.
+                records.append(
+                    {
+                        "task_id": task_id,
+                        "mode": mode,
+                        "transform": transform_name,
+                        "inverse_transform": INVERSE_TRANSFORMS[transform_name],
+                        "demo_permutation_index": permutation_index,
+                        "heldout_demo_index": selected_indices[heldout_pos],
+                        "context_demo_indices": ordered_indices,
+                        "prompt": build_icl_prompt(
+                            ordered_demos,
+                            transformed_query["input"],
+                        ),
+                        "target": build_target(transformed_query["output"]),
+                    }
+                )
+
+    return records
+
+
+def cap_records(
+    records: list[dict[str, Any]],
+    max_records: int | None,
+    seed: int,
+    task_id: str,
+) -> list[dict[str, Any]]:
+    """Limit one task's generated rows with a reproducible sample."""
+    if max_records is None:
+        return records
+    if max_records < 1:
+        raise ValueError("--max-ttt-records must be greater than 0")
+    if len(records) <= max_records:
+        return records
+
+    task_seed = seed + sum(ord(char) for char in task_id)
+    selected = random.Random(task_seed).sample(records, max_records)
+    return sorted(
+        selected,
+        key=lambda row: (
+            row["heldout_demo_index"],
+            row["transform"],
+            row["mode"],
+        ),
+    )
+
+
+def write_jsonl(records: list[dict[str, Any]], output_path: str | Path) -> None:
+    """Write JSONL records and create the output folder if needed."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        for record in records:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def write_json(value: dict[str, Any], output_path: str | Path) -> None:
+    """Write a readable JSON file and create the output folder if needed."""
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        json.dump(value, f, indent=2)
+        f.write("\n")
 
 
 DEFAULT_BUCKET = "arc-ttt-artifact"
@@ -248,6 +531,42 @@ def build_test_records(
     return records
 
 
+def add_training_grid_fields(
+    train_records: list[dict[str, Any]],
+    selected_pairs: list[dict[str, Any]],
+    selected_indices: list[int],
+) -> list[dict[str, Any]]:
+    """Attach structured grids to TTT rows inside the prep step."""
+    pair_by_index = {
+        selected_index: pair
+        for selected_index, pair in zip(selected_indices, selected_pairs)
+    }
+    enriched_records: list[dict[str, Any]] = []
+
+    for record in train_records:
+        transform_name = record["transform"]
+        context_pairs = [
+            pair_by_index[index]
+            for index in record.get("context_demo_indices", [])
+        ]
+        heldout_pair = pair_by_index[record["heldout_demo_index"]]
+
+        # The prompt is still the trainer-ready text, but these grid fields make
+        # the JSONL row inspectable and let future trainers build custom prompts.
+        transformed_context = transform_pairs(context_pairs, transform_name)
+        transformed_query = transform_pair(heldout_pair, transform_name)
+        enriched_records.append(
+            {
+                **record,
+                "context_pairs": transformed_context,
+                "query_input": transformed_query["input"],
+                "target_output": transformed_query["output"],
+            }
+        )
+
+    return enriched_records
+
+
 def step_1_ensure_feature_group_ready(args: argparse.Namespace) -> dict[str, Any]:
     """STEP 1: Create if allowed, then validate the prep Feature Group."""
     import boto3
@@ -347,7 +666,11 @@ def step_2_create_arc_prep(args: argparse.Namespace, run_id: str) -> dict[str, A
         seed=args.seed,
         task_id=task_id,
     )
-    training_records = train_records
+    training_records = add_training_grid_fields(
+        train_records,
+        selected_pairs=selected_pairs,
+        selected_indices=selected_indices,
+    )
 
     test_records = build_test_records(
         task_id=task_id,
